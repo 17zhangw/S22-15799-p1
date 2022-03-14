@@ -82,6 +82,10 @@ def task_project1_setup():
 
 
 def task_project1():
+    NUM_GIFTED_CHILD = 5
+    NUM_CANDIDATES = 5
+    NUM_SUBMIT = 2
+    NUM_PENDING = 20
 
     def construct_index_name(base_tbl, index_cols, include_cols):
         return "idx_" + base_tbl + "_keys_" + ("_".join(index_cols)) + "_inc_" + ("_".join(include_cols))
@@ -287,7 +291,7 @@ def task_project1():
                 'include_columns': include_columns + [new_include]
             }
 
-        for i in range(5):
+        for i in range(NUM_GIFTED_CHILD):
             # This is the "gifted child phase of this process".
             table_set = [key for (key, _) in tables.items()]
             random_table = random.choice(tuple(table_set))
@@ -319,7 +323,7 @@ def task_project1():
         random.shuffle(candidate_list)
 
         # At-most only evaluate X many candidates with models.
-        return candidate_list[0:5], candidate_list[5:]
+        return candidate_list[0:NUM_CANDIDATES], candidate_list[NUM_CANDIDATES:]
 
     def evaluate(connection, workloads, candidates):
         import pickle
@@ -386,7 +390,7 @@ def task_project1():
                 cursor.execute(f"SELECT hypopg_reset()")
                 candidate_costs[candidate] = candidate_cost
 
-        result = dict(sorted(candidate_costs.items(), key=itemgetter(1))[:2])
+        result = dict(sorted(candidate_costs.items(), key=itemgetter(1))[:NUM_SUBMIT])
         for k, v in result:
             candidate_costs.pop(k)
         return [k for (k, _) in result.items()], [k for (k, _) in candidate_costs.items()]
@@ -454,7 +458,7 @@ def task_project1():
                 f.write(item + "\n")
 
         with open("pending.txt", "w") as f:
-            items = pending[0:20]
+            items = pending[0:NUM_PENDING]
             for item in items:
                 f.write(pending + "\n")
 
