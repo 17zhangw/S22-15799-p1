@@ -46,7 +46,7 @@ def task_benchbase_clone():
                 "name": "repo_url",
                 "long": "repo_url",
                 "help": "The repository to clone from.",
-                "default": "https://github.com/cmu-db/benchbase.git",
+                "default": "https://github.com/apavlo/benchbase.git",
             },
             {
                 "name": "branch_name",
@@ -70,7 +70,9 @@ def task_benchbase_build():
             # Compile BenchBase.
             "./mvnw clean package -Dmaven.test.skip=true -P postgres",
             lambda: os.chdir("target"),
+            "mv benchbase-2021-SNAPSHOT.tgz benchbase-postgres.tgz",
             "tar xvzf benchbase-postgres.tgz",
+            "mv benchbase-2021-SNAPSHOT benchbase-postgres",
             # Move artifacts out.
             lambda: os.chdir(doit.get_initial_workdir()),
             f"mv {BUILD_PATH / f'target/benchbase-postgres/*'} {ARTIFACTS_PATH}",
