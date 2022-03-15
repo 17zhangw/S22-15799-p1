@@ -131,6 +131,7 @@ def task_project1():
               JOIN pg_catalog.pg_index i ON s.indexrelid = i.indexrelid
              WHERE s.idx_scan = 0      -- has never been scanned
                AND 0 <>ALL (i.indkey)  -- no index column is an expression
+               AND NOT i.indisexclusion -- is not an EXCLUSION
                AND NOT i.indisunique   -- is not a UNIQUE index
                AND NOT EXISTS          -- does not enforce a constraint
                    (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conindid = s.indexrelid)
@@ -157,6 +158,7 @@ def task_project1():
                AND att.atttypid != 0
                AND idx.indisunique = False
                AND idx.indisprimary = False
+               AND idx.indisexclusion = False
                AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conindid = statidx.indexrelid)
           GROUP BY statidx.relid,
                    statidx.indexrelid,
@@ -185,6 +187,7 @@ def task_project1():
                AND att.atttypid != 0
                AND idx.indisunique = False
                AND idx.indisprimary = False
+               AND idx.indisexclusion = False
                AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conindid = statidx.indexrelid)
           GROUP BY statidx.relid,
                    statidx.indexrelid,
