@@ -1,6 +1,7 @@
 from plumbum import cmd
 from plumbum.cmd import grep, awk
 
+import doit
 from dodos import VERBOSITY_DEFAULT
 
 DEFAULT_DB = "project1db"
@@ -22,15 +23,17 @@ DEFAULT_PASS = "project1pass"
 # so you have to escape %'s by Python %-formatting rules (no way to disable this behavior).
 
 def task_project1_setup():
-    mem_limit = int(awk['/MemAvailable/ { printf \"%d\", $2/1024/1024 }', "/proc/meminfo"]())
+    import math
+    import os
+    mem_limit = math.ceil(float(awk['/MemTotal/ { printf \"%.3f\", $2/1024/1024 }', "/proc/meminfo"]()))
     num_cpu = int(grep["-c", "^processor", "/proc/cpuinfo"]())
     echo_list = [
         "max_connections=100",
         f"shared_buffers={int(mem_limit/4)}GB",
         f"effective_cache_size={int(mem_limit*3/4)}GB",
-        f"maintenance_work_mem={int(mem_limit/16)}GB",
+        f"maintenance_work_mem={int(1024*mem_limit/16)}MB",
         "min_wal_size=1GB",
-        "max_wal_size=2GB",
+        "max_wal_size=4GB",
         "checkpoint_completion_target=0.9",
         "wal_buffers=16MB",
         "default_statistics_target=100",
@@ -38,8 +41,8 @@ def task_project1_setup():
         "effective_io_concurrency=100",
         f"max_parallel_workers={num_cpu}",
         f"max_worker_processes={num_cpu}",
-        f"max_parallel_workers_per_gather=4",
-        f"max_parallel_maintenance_workers=4",
+        f"max_parallel_workers_per_gather=2",
+        f"max_parallel_maintenance_workers=2",
         f"work_mem={int(1024*1024*(mem_limit*3/4)/(300)/4)}kB",
         "shared_preload_libraries='pg_stat_statements,pg_qualstats'",
         "pg_qualstats.track_constants=OFF",
@@ -52,23 +55,24 @@ def task_project1_setup():
     return {
         "actions": [
             # Install dependencies
-            lambda: cmd.sudo["apt-get"]["install", "postgresql-14-hypopg"].run_fg(),
-            lambda: cmd.sudo["apt-get"]["install", "postgresql-14-pg-qualstats"].run_fg(),
+            lambda: cmd.sudo["apt-get"]["install", "-y", "postgresql-14-hypopg"].run_fg(),
+            lambda: cmd.sudo["apt-get"]["install", "-y", "postgresql-14-pg-qualstats"].run_fg(),
+            lambda: cmd.sudo["apt-get"]["install", "-y", "libpq-dev"].run_fg(),
             "git submodule update --init --recursive",
             "pip install pandas",
             "pip install psycopg2",
             "pip install pglast",
-            "cd behavior/modeling/featurewiz",
+            lambda: os.chdir("behavior/modeling/featurewiz"),
             "pip install -r requirements.txt",
-            "cd ../../../",
+            lambda: os.chdir(doit.get_initial_workdir()),
             "pip install -r requirements.txt",
 
             # Open the models
             "mkdir -p artifacts",
             "cp models.tgz artifacts/",
-            "cd artifacts/",
+            lambda: os.chdir("artifacts"),
             "tar zxf models.tgz",
-            "cd ..",
+            lambda: os.chdir(doit.get_initial_workdir()),
 
             "rm -rf blocklist.txt",
             "rm -rf pending.txt",
@@ -88,20 +92,20 @@ def task_project1():
     NUM_PENDING = 20
 
     def construct_index_name(base_tbl, index_cols, include_cols):
-        return "idx_" + base_tbl + "_keys_" + ("_".join(index_cols)) + "_inc_" + ("_".join(include_cols))
+        return "idx_" + base_tbl + "_keys_" + ("$".join(index_cols)) + "_inc_" + ("$".join(include_cols))
 
     def reverse_index_sql(index_name):
         component0 = index_name.split("idx_")[1]
-        component1 = component[0].split("_keys_")
+        component1 = component0.split("_keys_")
         component2 = component1[1].split("_inc_")
 
         tbl_name = component1[0]
-        index_cols = component2[0]
-        include_cols = component2[1]
+        index_cols = component2[0].replace("$", ",")
+        include_cols = component2[1].replace("$", ",")
         if len(include_cols) == 0:
-            return f"CREATE INDEX {index_name} ON {tbl_name}({index_cols})"
+            return f"CREATE INDEX \"{index_name}\" ON {tbl_name}({index_cols});"
         else:
-            return f"CREATE INDEX {index_name} ON {tbl_name}({index_cols}) INCLUDE ({include_cols})"
+            return f"CREATE INDEX \"{index_name}\" ON {tbl_name}({index_cols}) INCLUDE ({include_cols});"
 
     def execute_query(connection, query, output_dict=False, key=None):
         from psycopg2.extras import RealDictCursor
@@ -277,6 +281,7 @@ def task_project1():
             new_include = random.choice(tuple(valid_new_index_columns))
             new_index_name = construct_index_name(rel, index_columns + [new_index], include_columns)
             new_include_name = construct_index_name(rel, index_columns, include_columns + [new_include])
+
             candidates[new_index_name] = {
                 'relname': rel,
                 'indexrelname': new_index_name,
@@ -329,6 +334,7 @@ def task_project1():
         import pickle
         from pathlib import Path
         from operator import itemgetter
+        import numpy as np
         model_dict = {}
         for ou_type_path in Path("artifacts/gbm/").glob("*"):
             ou_type = ou_type_path.name
@@ -345,56 +351,73 @@ def task_project1():
             for candidate in candidates:
                 candidate_cost = 0
                 sql = reverse_index_sql(candidate)
-                cursor.execute(f"SELECT * FROM hypopg_create_index('{sql}')")
-                for workload in workloads:
-                    cursor.execute(f"EXPLAIN (FORMAT JSON) {workload}")
-                    for record in cursor:
-                        json = record[0]
+                try:
+                    cursor.execute(f"SELECT * FROM hypopg_create_index('{sql}')")
+                    for workload in workloads:
+                        cursor.execute(f"EXPLAIN (FORMAT JSON) {workload}")
+                        for record in cursor:
+                            json = record[0]
 
-                    try:
-                        def diff(plan):
-                            if 'Plans' not in plan:
-                                return
+                        try:
+                            def diff(plan):
+                                if 'Plans' not in plan:
+                                    return
 
-                            for plan_obj in plan['Plans']:
-                                if plan_obj['Startup Cost'] >= plan['Startup Cost']:
-                                    plan['Startup Cost'] = 0.00001
-                                else:
-                                    plan['Startup Cost'] -= plan_obj['Startup Cost']
-
-                                if plan_obj['Total Cost'] >= plan['Total Cost']:
-                                    plan['Total Cost'] = 0.00001
-                                else:
-                                    plan['Total Cost'] -= plan_obj['Total Cost']
-                                diff(plan_obj)
-
-                        def accumulate(plan):
-                            if 'Plans' in plan:
                                 for plan_obj in plan['Plans']:
-                                    accumulate(plan_obj)
+                                    if plan_obj['Startup Cost'] >= plan['Startup Cost']:
+                                        plan['Startup Cost'] = 0.00001
+                                    else:
+                                        plan['Startup Cost'] -= plan_obj['Startup Cost']
 
-                            ou_type = plan['Node Type'].replace(' ', '')
-                            rows = float(plan['Plan Rows']) if plan['Plan Rows'] > 0 else 0.00001
-                            width = float(plan['Plan Width']) if plan['Plan Width'] > 0 else 0.00001
-                            startup = plan['Startup Cost'] if plan['Startup Cost'] > 0 else 0.00001
-                            total = plan['Total Cost'] if plan['Total Cost'] > 0 else 0.00001
-                            x = [rows, width, startup, total]
-                            candidate_cost = candidate_cost + model_dict[ou_type].predict(x)[0][-1]
+                                    if plan_obj['Total Cost'] >= plan['Total Cost']:
+                                        plan['Total Cost'] = 0.00001
+                                    else:
+                                        plan['Total Cost'] -= plan_obj['Total Cost']
+                                    diff(plan_obj)
 
-                        root = json[0]['Plan']
-                        diff(root)
-                        accumulate(root)
-                    except Exception as e:
-                        pass
+                            def accumulate(plan):
+                                cost = 0
+                                if 'Plans' in plan:
+                                    for plan_obj in plan['Plans']:
+                                        cost = cost + accumulate(plan_obj)
+
+                                ou_type = plan['Node Type'].replace(' ', '')
+                                if ou_type == "NestedLoop":
+                                    ou_type = "NestLoop"
+                                if ou_type == "Aggregate":
+                                    ou_type = "Agg"
+
+                                rows = float(plan['Plan Rows']) if plan['Plan Rows'] > 0 else 0.00001
+                                width = float(plan['Plan Width']) if plan['Plan Width'] > 0 else 0.00001
+                                startup = plan['Startup Cost'] if plan['Startup Cost'] > 0 else 0.00001
+                                total = plan['Total Cost'] if plan['Total Cost'] > 0 else 0.00001
+                                x = np.asarray([rows, width, startup, total]).reshape(1, -1)
+                                try:
+                                    cost = cost + model_dict[ou_type].predict(x)[0][-1]
+                                except Exception as e:
+                                    # Case where OU model does not exist. IN this case penalize.
+                                    cost = cost + 5 # penalty of 5
+                                    print(e)
+                                return cost
+
+                            root = json[0]['Plan']
+                            diff(root)
+                            candidate_cost = candidate_cost + accumulate(root) * workloads[workload]
+                        except Exception as e:
+                            # It's possible that we don't actually have the OU model sad.
+                            print(e)
+                            pass
+                except Exception as e:
+                    print(e)
+                    pass
 
                 cursor.execute(f"SELECT hypopg_reset()")
                 candidate_costs[candidate] = candidate_cost
 
-        result = dict(sorted(candidate_costs.items(), key=itemgetter(1))[:NUM_SUBMIT])
-        for k, v in result:
+        result = dict(sorted(candidate_costs.items(), key=itemgetter(1))[0:NUM_SUBMIT])
+        for k, v in result.items():
             candidate_costs.pop(k)
         return [k for (k, _) in result.items()], [k for (k, _) in candidate_costs.items()]
-
 
     def derive_actions(workload_csv, timeout):
         import psycopg2
@@ -402,24 +425,29 @@ def task_project1():
         blocklist = set()
         try:
             with open("blocklist.txt", "r") as f:
-                blocklist.extend(f.readlines())
-        except:
+                lines = f.read().splitlines()
+                blocklist.update(lines)
+        except Exception as e:
+            print(e)
             pass
 
         pending = set()
         try:
             with open("pending.txt", "r") as f:
-                pending.extend(f.readlines())
-        except:
+                lines = f.read().splitlines()
+                pending.update(lines)
+        except Exception as e:
+            print(e)
             pass
 
         actions = []
+        workloads = process_workload(workload_csv)
         with psycopg2.connect("host=localhost dbname=project1db user=project1user password=project1pass") as connection:
             # Turn on auto-commit.
             connection.set_session(autocommit=True)
-            workloads = process_workload(workload_csv)
 
             connection.cursor().execute("CREATE EXTENSION IF NOT EXISTS hypopg")
+            connection.cursor().execute("CREATE EXTENSION IF NOT EXISTS pg_qualstats")
 
             # Get set of useless indexes.
             useless_indexes = fetch_useless_indexes(connection)
@@ -433,7 +461,7 @@ def task_project1():
                 if index in orig_names:
                     remove_list.append(orig_names[index])
                 blocklist.add(index)
-                actions.append(f"DROP INDEX IF EXISTS {index}")
+                actions.append(f"DROP INDEX IF EXISTS {index};")
             [existing_indexes.pop(index) for index in remove_list]
 
             # get_indexadvisor() definition
@@ -441,17 +469,25 @@ def task_project1():
 
             # let the mutations of the future decide the true course...
             candidates = mutate(connection, existing_indexes)
+            for (k, v) in advised_indexes.items():
+                candidates[k] = v
 
             # eliminate candidates based on pending and blocklist
             candidates, pending = eliminate_candidates(candidates, blocklist, pending)
 
             # evaluate hypothetical index performances
             candidates, unselected = evaluate(connection, workloads, candidates)
+
             pending.extend(unselected)
-            actions.append("SELECT hypopg_reset()")
+            actions.append("SELECT hypopg_reset();")
             for candidate in candidates:
                 actions.append(reverse_index_sql(candidate))
 
+        actions.append("SELECT pg_qualstats_reset();")
+        with open("actions.sql", "w") as f:
+            for action in actions:
+                f.write(action)
+                f.write("\n")
 
         with open("blocklist.txt", "w") as f:
             for item in blocklist:
@@ -460,13 +496,7 @@ def task_project1():
         with open("pending.txt", "w") as f:
             items = pending[0:NUM_PENDING]
             for item in items:
-                f.write(pending + "\n")
-
-        actions.append("SELECT pg_qualstats_reset()")
-        with open("actions.sql", "w") as f:
-            for action in actions:
-                f.write(action)
-                f.write("\n")
+                f.write(item + "\n")
 
         print("Done generating actions for round")
 
@@ -501,9 +531,22 @@ def task_project1():
         data.reset_index(inplace=True, drop=True)
         fingerprint = []
         queries = []
-        for query in data:
-            queries.append(query)
-            fingerprint.append(pglast.parser.fingerprint(query))
+
+        import psycopg2
+        with psycopg2.connect("host=localhost dbname=project1db user=project1user password=project1pass") as connection:
+            connection.set_session(autocommit=True)
+            connection.cursor().execute("CREATE EXTENSION IF NOT EXISTS pg_qualstats")
+            for query in data:
+                try:
+                    connection.cursor().execute(query)
+                except Exception as e:
+                    # At this point, we can't deal with the exception. Sigh.
+                    # But postgres also doesn't give us enough info so SIGH.
+                    print(e)
+                    pass
+
+                queries.append(query)
+                fingerprint.append(pglast.parser.fingerprint(query))
 
         data = pd.DataFrame.from_records(zip(list(data), fingerprint), columns=["statement", "fingerprint"])
         def apply_func(df):
